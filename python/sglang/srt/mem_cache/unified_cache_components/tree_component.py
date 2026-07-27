@@ -2,56 +2,41 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from enum import Enum, IntFlag
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 from numpy import float64
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
+from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        CacheAction,
+        ComponentAction,
+    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
     from sglang.srt.mem_cache.unified_radix_cache import (
+        NodeId,
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
 
 
-class ComponentType(int, Enum):
-    """Integer enum so that per-node list/tuple storage can be indexed directly."""
-
-    FULL = 0
-    SWA = 1
-    MAMBA = 2
-
-    def __str__(self) -> str:  # keep human-readable logging
-        return self.name.lower()
-
-    @property
-    def is_full(self) -> bool:
-        return self == ComponentType.FULL
-
-    @property
-    def is_swa(self) -> bool:
-        return self == ComponentType.SWA
-
-    @property
-    def is_mamba(self) -> bool:
-        return self == ComponentType.MAMBA
-
-
-BASE_COMPONENT_TYPE = ComponentType.FULL
 _NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
@@ -67,12 +52,45 @@ class ComponentData:
     host_lock_ref: int = 0
 
 
+class EvictLayer(IntFlag):
+    """Which storage layer(s) to evict.  Combinable via bitwise OR."""
+
+    DEVICE = 1
+    HOST = 2
+    ALL = DEVICE | HOST
+
+
+@dataclasses.dataclass(frozen=True)
+class PrepareLoadBackResult:
+    """Outcome of prepare_load_back; default = nothing to prepare."""
+
+    # Freshly allocated device mamba slot, recovered on failure.
+    allocated_mamba_slot: Optional[torch.Tensor] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PreparePrefetchResult:
+    """Outcome of prepare_prefetch; default = nothing to prepare."""
+
+    # Host pool exhausted; the caller aborts the prefetch.
+    alloc_failed: bool = False
+    # The component's pre-allocated host buffer (None = skip the build).
+    host_indices: Optional[torch.Tensor] = None
+
+
 class CacheTransferPhase(str, Enum):
 
     BACKUP_HOST = "backup_host"  # D→H
     LOAD_BACK = "load_back"  # H→D
     BACKUP_STORAGE = "backup_storage"  # H→Storage
     PREFETCH = "prefetch"  # Storage→H
+
+
+class LRURefreshPhase(str, Enum):
+
+    WALKDOWN = "walkdown"  # touching a node while walking through the tree
+    MATCH_END = "match_end"  # end of a successful prefix match
+    INSERT_END = "insert_end"  # after a new/updated leaf is committed
 
 
 def get_and_increase_time_counter() -> float64:
@@ -91,40 +109,84 @@ def next_component_uuid() -> int:
 class TreeComponent(ABC):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
+        # Populated when the component passed to TreeCore constructor.
+        self.tree_core: Optional[UnifiedTreeCore] = None
+        self.is_evict_device_ongoing = False
 
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
-    def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component_data[self.component_type].value is not None
+    def node_has_component_data(
+        self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
+    ) -> bool:
+        cd = node.component_data[self.component_type]
+        if target is EvictLayer.DEVICE:
+            return cd.value is not None
+        return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
+        """Whether this component's data is evicted from device but host-backed."""
+        cd = node.component_data[self.component_type]
+        return cd.value is None and cd.host_value is not None
+
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        ct = self.component_type
+        match phase:
+            case LRURefreshPhase.WALKDOWN:
+                if node.component_data[ct].value is None:
+                    return
+                self.tree_core.lru_lists[ct].reset_node_mru(node)
+            case LRURefreshPhase.MATCH_END:
+                self.tree_core.lru_lists[ct].reset_node_and_parents_mru(
+                    node, root_node, self.node_has_component_data
+                )
+            case LRURefreshPhase.INSERT_END:
+                # WALKDOWN already refreshed every node on the insert path
+                # (including the new leaf), so there is nothing more to do.
+                return
+            case _:
+                raise ValueError(f"Unknown LRURefreshPhase: {phase}")
+
     @abstractmethod
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         """Return a per-match stateful predicate that decides whether a node
         is a valid match boundary for this component.
         Called once per match_prefix; the returned closure may carry state.
-        - Full: always True (every node is valid).
+        When match_device_only is true, host-backed nodes must not be accepted
+        as valid match boundaries.
+        - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
         - Mamba: returns True iff the node has mamba component data."""
         ...
 
-    def finalize_match_result(
+    def finalize_match_result_in_tree_core(
         self,
         result: MatchResult,
         params: MatchPrefixParams,
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        """Post-process the match result after prefix matching completes.
-        - Full & SWA: pass through unchanged.
-        - Mamba: performs copy-on-write — allocates a new mamba slot, copies
-          the matched node's mamba state into the request pool, and records
-          branching_seqlen in result."""
+        """Tree-side post-processing inside the match walk (no cache access)."""
+        return result
+
+    def finalize_match_result_in_cache(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        """Cache-level finalize after the match walk, dispatched by
+        `UnifiedRadixCache.match_prefix`; receives the NodeId-based result.
+        - Mamba: performs the copy-on-write into a per-request slot."""
         return result
 
     def update_component_on_insert_overlap(
@@ -134,6 +196,7 @@ class TreeComponent(ABC):
         total_prefix_len: int,
         value_slice: torch.Tensor,
         params: InsertParams,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> int:
         """Called per-node when an insert's key overlaps an existing node.
         Returns the index within value_slice from which this component
@@ -143,12 +206,19 @@ class TreeComponent(ABC):
         portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
-        return False
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        """Called after _unevict_node_on_insert restores the base (Full) value
+        on an evicted node. Aux components (e.g. SWA) override this to rebuild
+        their own data from the freshly assigned base value when their entry
+        is still tombstoned. Default no-op."""
+        return None
 
     def commit_insert_component_data(
         self,
@@ -156,6 +226,7 @@ class TreeComponent(ABC):
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Finalize component data on the target (leaf) node after the insert
         walk completes. Called once per insert.
@@ -186,17 +257,27 @@ class TreeComponent(ABC):
         ...
 
     @abstractmethod
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
-        For internal (non-leaf) nodes: free memory and tombstone the value
-        (set to None); the node structure is kept.
-        For leaf nodes: free memory; the node will be deleted by caller.
-        Returns the number of tokens/slots freed.
-        - Full: frees full_value via token_to_kv_pool_allocator.
-        - SWA: frees swa value via swa_token_to_kv_pool_allocator;
-          only tombstones on internal nodes.
-        - Mamba: frees mamba value via mamba_token_to_kv_pool_allocator;
-          only tombstones on internal nodes."""
+
+        *target* controls which layer(s) to evict:
+          - DEVICE: free device memory and tombstone (value = None).
+                    Host data is untouched.
+          - HOST:   free host memory (host_value = None).
+                    Device data is untouched.
+          - ALL:    free both device and host memory.
+                    No tombstone — caller will delete the node.
+
+        Freed indices are collected into *device_frees*/*host_frees* for the
+        Controller to drain, never freed inline.
+
+        Returns (device_freed, host_freed) token counts."""
         ...
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -226,24 +307,63 @@ class TreeComponent(ABC):
         - Full evict internal: cascades to SWA + Mamba."""
         return 0
 
+    def evict_device_start(self, request_cnt: int) -> None:
+        """Begin this component's device-eviction walk (build its cursor/heap)."""
+        assert (
+            not self.is_evict_device_ongoing
+        ), f"{self.component_type} device eviction already in progress"
+        self._evict_device_start(request_cnt)
+        self.is_evict_device_ongoing = True
+
+    def evict_device_next_node(
+        self,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> Optional[NodeId]:
+        """Return the next device-leaf node for the driver to evict, or None.
+        Internal nodes are tombstoned inline (no IO)."""
+        assert (
+            self.is_evict_device_ongoing
+        ), f"{self.component_type} device eviction not started"
+        return self._evict_device_next_node(tracker, device_frees, host_frees)
+
+    def evict_device_end(self) -> None:
+        """Clear this component's device-eviction walk state."""
+        assert (
+            self.is_evict_device_ongoing
+        ), f"{self.component_type} device eviction not started"
+        self._evict_device_end()
+        self.is_evict_device_ongoing = False
+
     @abstractmethod
-    def drive_eviction(
-        self, params: EvictParams, tracker: dict[ComponentType, int]
-    ) -> None:
-        """Drive eviction from this component's LRU list.
-        Each component extracts its own request from params, walks its own
-        LRU, evicts, and calls cache._cascade_evict for priority cascade.
-        Updates the shared tracker with freed amounts for all components.
-        - Full: walks leaf LRU, evicts full then cascades entire leaf.
-        - Mamba: walks full LRU; tombstones internal nodes (with cascade
-          to equal-priority components like swa), cascades leaves to all."""
+    def _evict_device_start(self, request_cnt: int) -> None:
+        """Build this component's eviction cursor/heap."""
+        ...
+
+    @abstractmethod
+    def _evict_device_next_node(
+        self,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> Optional[NodeId]:
+        """Advance the walk; return the next device leaf or None."""
+        ...
+
+    @abstractmethod
+    def _evict_device_end(self) -> None:
+        """Clear this component's eviction cursor/heap."""
         ...
 
     @abstractmethod
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
-        """Increment lock_ref for this component, protecting nodes from
+        """Increment component lock refs, protecting nodes from
         eviction. Updates evictable → protected size on first lock.
         - Full: path-lock — walks from node up to root, incrementing
           lock_ref on every ancestor.
@@ -251,21 +371,31 @@ class TreeComponent(ABC):
           sliding window is filled; records a component_uuid at the
           boundary for release_component_lock to know where to stop.
         - Mamba: single-node lock — only increments lock_ref on the
-          node itself (mamba state is per-leaf, not per-path)."""
+          node itself (mamba state is per-leaf, not per-path).
+
+        When ``lock_host`` is True, the lock applies to host-side state:
+        - Full: single-node host lock.
+        - SWA: host window-lock with a dedicated host UUID boundary.
+        - Mamba: single-node host lock with host LRU detach."""
         ...
 
     @abstractmethod
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
-        """Decrement lock_ref for this component, un-protecting nodes.
+        """Decrement component lock refs, un-protecting nodes.
         Updates protected → evictable size when lock_ref drops to 0.
         - Full: path-unlock — walks from node up to root, decrementing
           lock_ref on every ancestor.
         - SWA: path-unlock — walks upward, stopping at the node whose
           component_uuid matches the one recorded during acquire.
         - Mamba: single-node unlock — only decrements lock_ref on the
-          node itself."""
+          node itself.
+
+        When ``lock_host`` is True, the inverse host-side semantics apply."""
         ...
 
     def prepare_for_caching_req(
@@ -302,10 +432,52 @@ class TreeComponent(ABC):
         paths it is still provided so components can free their resources."""
         pass
 
+    def free_out_of_window_slots(
+        self, req: Req, pre_len: int, insert_params: InsertParams
+    ) -> None:
+        pass
+
+    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+        """Free evicted host-tier values back to this component's host pool."""
+        raise NotImplementedError(f"{self.component_type} must free its host values")
+
     # ---- HiCache Hooks ----
 
+    def prepare_load_back(
+        self,
+        node_id: NodeId,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        """Cache-level pre-allocation before a load-back builds its transfers."""
+        return PrepareLoadBackResult()
+
+    def finalize_load_back(
+        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        """Release state populated by prepare_load_back when the load-back did
+        not go through."""
+        pass
+
+    def prepare_prefetch(
+        self,
+        node_id: NodeId,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        """Cache-level host pre-allocation before a prefetch builds its transfers."""
+        return PreparePrefetchResult()
+
     def build_hicache_transfers(
-        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        *,
+        mamba_pool_idx: Optional[torch.Tensor] = None,
+        host_indices: Optional[torch.Tensor] = None,
+        token_ids: Optional[Sequence[int]] = None,
+        prefetch_tokens: int = 0,
+        last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
@@ -316,14 +488,29 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        *,
+        cache_actions: list[CacheAction | ComponentAction],
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass
 
     def drive_host_eviction(
-        self, num_tokens: int, tracker: dict[ComponentType, int]
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Evict from this component's host-side resources.
+        """Evict from this component's host-side resources, collecting freed
+        values into *device_frees*/*host_frees* for the Controller to drain.
         Called by HostPoolGroup when the host pool is full.
         Default no-op for components without host storage."""
         pass
+
+    def apply_component_action(self, action: ComponentAction) -> None:
+        """Apply a component-routed cache action; dispatched by the cache."""
+        raise NotImplementedError(
+            f"{self.component_type} cannot apply {type(action).__name__}"
+        )

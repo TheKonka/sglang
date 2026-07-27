@@ -9,7 +9,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    pred_noise_to_pred_video,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -94,7 +96,7 @@ class DmdDenoisingStage(DenoisingStage):
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
 
         denoising_loop_start_time = time.time()
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
@@ -170,10 +172,13 @@ class DmdDenoisingStage(DenoisingStage):
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
+                            timestep=video_timesteps,
                             scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
